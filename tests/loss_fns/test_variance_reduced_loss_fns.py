@@ -263,6 +263,19 @@ def test_equals_expected_loss(
             ),
         ),
         (
+            nn.CrossEntropyLoss,
+            loss_fns.CrossEntropyLossVR,
+            models.ViT_B_32.from_pretrained_weights(
+                in_size=224,
+                out_size=10,
+                cov=None,
+            ),
+            torch.randn((32, 3, 224, 224), generator=torch.Generator().manual_seed(42)),
+            torch.empty(32, dtype=torch.long).random_(
+                10, generator=torch.Generator().manual_seed(3244)
+            ),
+        ),
+        (
             nn.BCEWithLogitsLoss,
             loss_fns.BCEWithLogitsLossVR,
             models.MLP(
@@ -281,8 +294,12 @@ def test_equals_torch_loss_for_deterministic_models(
 ):
 
     # Get representation of input and output layer
-    model_representation = model[0:-1]
-    output_layer = model[-1]
+    try:
+        model_representation = model[0:-1]
+        output_layer = model[-1]
+    except TypeError:
+        model_representation = model.representation
+        output_layer = model.fc
 
     # Compare losses
     loss = loss_fn(reduction=reduction)(

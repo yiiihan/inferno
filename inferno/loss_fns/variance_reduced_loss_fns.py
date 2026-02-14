@@ -164,7 +164,7 @@ class MSELossVR(nn.modules.loss._Loss):
 
 
 class BCEWithLogitsLossVR(nn.modules.loss._Loss):
-    r"""Binary Cross Entropy Loss with reduced variance for models with stochastic parameters.
+    r"""Binary Cross-Entropy Loss with reduced variance for models with stochastic parameters.
 
     The loss on a single datapoint is given by
 
@@ -328,7 +328,7 @@ class BCEWithLogitsLossVR(nn.modules.loss._Loss):
 
 
 class CrossEntropyLossVR(nn.modules.loss._Loss):
-    r"""Cross Entropy Loss with reduced variance for models with stochastic parameters.
+    r"""Cross-Entropy Loss with reduced variance for models with stochastic parameters.
 
     The loss on a single datapoint is given by
 
@@ -341,7 +341,7 @@ class CrossEntropyLossVR(nn.modules.loss._Loss):
         \end{align*}
     $$
 
-    which for a linear Gaussian output layer equals
+    which for a linear Gaussian output layer results in
 
     $$
         \begin{equation*}
