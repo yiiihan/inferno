@@ -185,7 +185,8 @@ class NGD(torch.optim.SGD):
                     grad = stacked_grad[start_idx:end_idx, ...].reshape(param.shape)
                     if not is_mean_param:
                         # NOTE: NGD requires factor 2 for covariance parameters
-                        grad = 2 * grad
+                        # grad = 2 * grad
+                        grad = 0.5 * grad  # TODO: or a factor 1/2?
 
                     start_idx = end_idx
 
