@@ -18,10 +18,16 @@ from .resnet import (
     WideResNet50,
     WideResNet101,
 )
+from .gpt import GPT, GPT2_Large, GPT2_Medium, GPT2_Small, GPT2_XL
 from .vit import VisionTransformer, ViT_B_16, ViT_B_32, ViT_H_14, ViT_L_16, ViT_L_32
 
-___all__ = [
+__all__ = [
     "Ensemble",
+    "GPT",
+    "GPT2_Small",
+    "GPT2_Medium",
+    "GPT2_Large",
+    "GPT2_XL",
     "LeNet5",
     "MLP",
     "ResNet",
