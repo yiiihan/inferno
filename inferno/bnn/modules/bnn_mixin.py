@@ -205,7 +205,7 @@ def parameters_and_lrs_of_torch_module(
         ),
     ):
         fan_out = module.weight.shape.numel()
-        param_groups + [
+        param_groups += [
             {
                 "params": [module.weight],
                 "lr": lr
@@ -219,7 +219,7 @@ def parameters_and_lrs_of_torch_module(
         ]
 
         if module.bias is not None:
-            param_groups + [
+            param_groups += [
                 {
                     "params": [module.bias],
                     "lr": lr
