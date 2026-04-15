@@ -176,6 +176,7 @@ class Encoder(bnn.BNNMixin, nn.Module):
         attention_dropout: float,
         fused_attn: bool = True,
         norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+        pre_layernorm: bool = False,
         parametrization: params.Parametrization = params.MaximalUpdate(),
         cov: (
             params.FactorizedCovariance
@@ -192,6 +193,7 @@ class Encoder(bnn.BNNMixin, nn.Module):
         self.pos_embedding = nn.Parameter(
             torch.empty(1, seq_length, hidden_dim).normal_(std=0.02)
         )  # from BERT
+        self.pre_ln = norm_layer(hidden_dim) if pre_layernorm else None
         self.dropout = nn.Dropout(dropout)
         layers: OrderedDict[str, nn.Module] = OrderedDict()
         for i in range(num_layers):
@@ -224,6 +226,9 @@ class Encoder(bnn.BNNMixin, nn.Module):
         self.layers.reset_parameters()
 
         reset_parameters_of_torch_module(self.ln, parametrization=self.parametrization)
+
+        if self.pre_ln is not None:
+            reset_parameters_of_torch_module(self.pre_ln, parametrization=self.parametrization)
 
     def parameters_and_lrs(
         self,
@@ -259,6 +264,14 @@ class Encoder(bnn.BNNMixin, nn.Module):
             optimizer=optimizer,
         )
 
+        if self.pre_ln is not None:
+            param_groups += parameters_and_lrs_of_torch_module(
+                self.pre_ln,
+                lr=lr,
+                parametrization=self.parametrization,
+                optimizer=optimizer,
+            )
+
         return param_groups
 
     def forward(
@@ -278,6 +291,9 @@ class Encoder(bnn.BNNMixin, nn.Module):
             )
         else:
             input = input + self.pos_embedding
+
+        if self.pre_ln is not None:
+            input = bnn.batched_forward(self.pre_ln, num_batch_dims=num_sample_dims + 1)(input)
 
         output = self.dropout(input)
         output = self.layers(
@@ -364,6 +380,8 @@ class VisionTransformer(bnn.BNNMixin, nn.Module):
         norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
         fused_attn: bool = True,
         conv_stem_configs: list[NamedTuple] | None = None,
+        pre_layernorm: bool = False,
+        normalize_representation: bool = False,
         parametrization: params.Parametrization = params.MaximalUpdate(),
         cov: (
             params.FactorizedCovariance
@@ -392,6 +410,7 @@ class VisionTransformer(bnn.BNNMixin, nn.Module):
                 "See also: https://pytorch.org/docs/stable/func.batch_norm.html#patching-batch-norm."
             )
         self.norm_layer = norm_layer
+        self.normalize_representation = normalize_representation
         cov = _check_cov(cov, ["conv_proj", "encoder", "pre_head.pre_logits", "fc"])
         self.fused_attn = fused_attn
 
@@ -428,6 +447,7 @@ class VisionTransformer(bnn.BNNMixin, nn.Module):
             attention_dropout=attention_dropout,
             norm_layer=norm_layer,
             fused_attn=self.fused_attn,
+            pre_layernorm=pre_layernorm,
             parametrization=parametrization,
             cov=cov["encoder"],
         )
@@ -512,6 +532,93 @@ class VisionTransformer(bnn.BNNMixin, nn.Module):
             # Freeze the pretrained weights
             for name, param in model.named_parameters():
                 if name.replace(".params", "") in pretrained_weights:
+                    param.requires_grad = False
+
+        return model
+
+    @classmethod
+    def from_clip_pretrained_weights(
+        cls,
+        in_size: int,
+        out_size: int,
+        clip_model_name: str,
+        freeze: bool = False,
+        pre_layernorm: bool = True,
+        *args,
+        **kwargs,
+    ):
+        """Load a VisionTransformer model with CLIP pretrained weights from HuggingFace.
+
+        The fc (classification head) is always randomly initialised since CLIP
+        has no classification head.  All other layers are loaded from CLIP's
+        vision encoder.
+
+        :param in_size: Size of the input (i.e. image size).
+        :param out_size: Number of output classes.
+        :param clip_model_name: HuggingFace model identifier, e.g.
+            ``"openai/clip-vit-base-patch32"``.
+        :param freeze: Whether to freeze the loaded weights.
+        """
+        import re
+        try:
+            from transformers import CLIPModel
+        except ImportError:
+            raise ImportError(
+                "The `transformers` package is required to load CLIP weights. "
+                "Install it with: pip install transformers"
+            )
+
+        clip_model = CLIPModel.from_pretrained(clip_model_name, use_safetensors=True)
+        clip_sd = clip_model.vision_model.state_dict()
+
+        # Map CLIP vision encoder keys to inferno ViT keys.
+        inferno_sd = {}
+        for clip_key, value in clip_sd.items():
+            if clip_key == "embeddings.class_embedding":
+                inferno_sd["class_token"] = value.reshape(1, 1, -1)
+            elif clip_key == "embeddings.patch_embedding.weight":
+                inferno_sd["conv_proj.weight"] = value
+            elif clip_key == "embeddings.position_embedding.weight":
+                # CLIP: [seq, hidden] → inferno: [1, seq, hidden]
+                inferno_sd["encoder.pos_embedding"] = value.unsqueeze(0)
+            elif clip_key in ("pre_layrnorm.weight", "pre_layrnorm.bias"):
+                suffix = clip_key.split(".")[-1]
+                inferno_sd[f"encoder.pre_ln.{suffix}"] = value
+            elif clip_key in ("post_layernorm.weight", "post_layernorm.bias"):
+                suffix = clip_key.split(".")[-1]
+                inferno_sd[f"encoder.ln.{suffix}"] = value
+            else:
+                m = re.match(r"encoder\.layers\.(\d+)\.(.+)", clip_key)
+                if m:
+                    i, rest = m.group(1), m.group(2)
+                    if rest.startswith("self_attn."):
+                        attn_rest = rest[len("self_attn."):]
+                        inferno_sd[
+                            f"encoder.layers.encoder_layer_{i}.self_attention.{attn_rest}"
+                        ] = value
+                    elif rest.startswith("layer_norm1."):
+                        inferno_sd[
+                            f"encoder.layers.encoder_layer_{i}.ln_1.{rest.split('.')[-1]}"
+                        ] = value
+                    elif rest.startswith("layer_norm2."):
+                        inferno_sd[
+                            f"encoder.layers.encoder_layer_{i}.ln_2.{rest.split('.')[-1]}"
+                        ] = value
+                    elif rest == "mlp.fc1.weight":
+                        inferno_sd[f"encoder.layers.encoder_layer_{i}.mlp.0.weight"] = value
+                    elif rest == "mlp.fc1.bias":
+                        inferno_sd[f"encoder.layers.encoder_layer_{i}.mlp.0.bias"] = value
+                    elif rest == "mlp.fc2.weight":
+                        inferno_sd[f"encoder.layers.encoder_layer_{i}.mlp.3.weight"] = value
+                    elif rest == "mlp.fc2.bias":
+                        inferno_sd[f"encoder.layers.encoder_layer_{i}.mlp.3.bias"] = value
+
+        model = cls(*args, **kwargs, in_size=in_size, out_size=out_size, pre_layernorm=pre_layernorm)
+        model.load_state_dict(inferno_sd, strict=False)
+
+        if freeze:
+            for name, param in model.named_parameters():
+                if name.replace(".params", "") in inferno_sd:
                     param.requires_grad = False
 
         return model
@@ -687,6 +794,10 @@ class VisionTransformer(bnn.BNNMixin, nn.Module):
                 input_contains_samples=True,
                 parameter_samples=parameter_samples,
             )
+
+        if self.normalize_representation:
+            x = torch.nn.functional.normalize(x, dim=-1)
+
         return x
 
     def forward(
@@ -756,6 +867,25 @@ class ViT_B_16(VisionTransformer):
             **kwargs,
         )
 
+    @classmethod
+    def from_clip_pretrained_weights(
+        cls,
+        in_size: int,
+        out_size: int,
+        clip_model_name: str = "openai/clip-vit-base-patch16",
+        freeze: bool = False,
+        *args,
+        **kwargs,
+    ):
+        return super().from_clip_pretrained_weights(
+            in_size=in_size,
+            out_size=out_size,
+            clip_model_name=clip_model_name,
+            freeze=freeze,
+            *args,
+            **kwargs,
+        )
+
 
 class ViT_B_32(VisionTransformer):
     """ViT_B_32
@@ -792,6 +922,25 @@ class ViT_B_32(VisionTransformer):
             in_size=in_size,
             out_size=out_size,
             weights=weights,
+            freeze=freeze,
+            *args,
+            **kwargs,
+        )
+
+    @classmethod
+    def from_clip_pretrained_weights(
+        cls,
+        in_size: int,
+        out_size: int,
+        clip_model_name: str = "openai/clip-vit-base-patch32",
+        freeze: bool = False,
+        *args,
+        **kwargs,
+    ):
+        return super().from_clip_pretrained_weights(
+            in_size=in_size,
+            out_size=out_size,
+            clip_model_name=clip_model_name,
             freeze=freeze,
             *args,
             **kwargs,
