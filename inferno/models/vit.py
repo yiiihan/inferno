@@ -571,6 +571,9 @@ class VisionTransformer(bnn.BNNMixin, nn.Module):
         clip_model = CLIPModel.from_pretrained(clip_model_name, use_safetensors=True)
         clip_sd = clip_model.vision_model.state_dict()
 
+        # Derive patch_size from CLIP's patch embedding weight: [out_ch, in_ch, kH, kW]
+        clip_patch_size = clip_sd["embeddings.patch_embedding.weight"].shape[-1]
+
         # Map CLIP vision encoder keys to inferno ViT keys.
         inferno_sd = {}
         for clip_key, value in clip_sd.items():
@@ -580,6 +583,20 @@ class VisionTransformer(bnn.BNNMixin, nn.Module):
                 inferno_sd["conv_proj.weight"] = value
             elif clip_key == "embeddings.position_embedding.weight":
                 # CLIP: [seq, hidden] → inferno: [1, seq, hidden]
+                # Interpolate spatial positions if target resolution differs from CLIP.
+                clip_seq, hidden = value.shape
+                target_seq = (in_size // clip_patch_size) ** 2 + 1
+                if clip_seq != target_seq:
+                    cls_pos = value[:1]  # [1, hidden]
+                    spatial = value[1:]  # [clip_seq-1, hidden]
+                    clip_grid = int(round((clip_seq - 1) ** 0.5))
+                    target_grid = int(round((target_seq - 1) ** 0.5))
+                    spatial = spatial.reshape(1, clip_grid, clip_grid, hidden).permute(0, 3, 1, 2)
+                    spatial = torch.nn.functional.interpolate(
+                        spatial.float(), size=(target_grid, target_grid), mode="bicubic", align_corners=False
+                    ).to(value.dtype)
+                    spatial = spatial.permute(0, 2, 3, 1).reshape(target_seq - 1, hidden)
+                    value = torch.cat([cls_pos, spatial], dim=0)
                 inferno_sd["encoder.pos_embedding"] = value.unsqueeze(0)
             elif clip_key in ("pre_layrnorm.weight", "pre_layrnorm.bias"):
                 suffix = clip_key.split(".")[-1]
@@ -615,6 +632,10 @@ class VisionTransformer(bnn.BNNMixin, nn.Module):
 
         model = cls(*args, **kwargs, in_size=in_size, out_size=out_size, pre_layernorm=pre_layernorm)
         model.load_state_dict(inferno_sd, strict=False)
+
+        # CLIP patch_embedding has no bias; zero-init to avoid a random offset
+        if model.conv_proj.params.bias is not None:
+            nn.init.zeros_(model.conv_proj.params.bias)
 
         if freeze:
             for name, param in model.named_parameters():

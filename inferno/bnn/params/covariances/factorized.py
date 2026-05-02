@@ -131,7 +131,7 @@ class FactorizedCovariance(nn.Module):
         i = 0
         for name, param in self.factor.items():
             if param is not None:
-                result_dict[name] = split_result[i].view(
+                result_dict[name] = split_result[i].reshape(
                     *sample_shape, *param.shape[:-1]
                 )
                 i += 1
@@ -142,7 +142,7 @@ class FactorizedCovariance(nn.Module):
         """Stack parameters into a single tensor."""
         stacked_parameters = torch.vstack(
             [
-                factor_param.view(-1, self.rank)
+                factor_param.reshape(-1, self.rank)
                 for factor_param in self.factor.values()
                 if factor_param is not None
             ]

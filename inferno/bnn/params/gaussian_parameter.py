@@ -58,7 +58,7 @@ class GaussianParameter(BNNParameter):
         }
 
         mean_params_stacked = torch.hstack(
-            [tens.view(-1) for tens in mean_params.values()]
+            [tens.reshape(-1) for tens in mean_params.values()]
         )
 
         # Scale with inverse temperature if not training and the parameters are in the output layer

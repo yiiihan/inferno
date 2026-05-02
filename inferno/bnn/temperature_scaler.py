@@ -51,11 +51,13 @@ class TemperatureScaler(nn.Module):
         self,
         model: nn.Module,
         dataloader: torch.utils.data.DataLoader,
+        max_batches: int | None = None,
     ) -> None:
         """Optimizes the temperature of the model.
 
         :param model: The model to be calibrated, assumed to return logits.
         :param dataloader: The dataloader for the dataset to calibrate on (typically the validation set).
+        :param max_batches: Maximum number of batches to use. If None, uses the full dataloader.
         """
         # Set the model to evaluation mode to ensure temperature scaling is applied
         model_was_in_training_mode = False
@@ -77,6 +79,21 @@ class TemperatureScaler(nn.Module):
         if temperature_parameter is None:
             raise ValueError("Model does not have a temperature parameter.")
 
+        # Pre-collect logits once (no gradient through backbone) and store on CPU
+        # to avoid re-running the expensive model forward pass in every LBFGS iteration.
+        # model(inputs) returns raw_logits / temperature, so raw_logits = output * temperature.
+        pre_temp_logits = []
+        all_targets = []
+        with torch.no_grad():
+            for i, (inputs, targets) in enumerate(dataloader):
+                if max_batches is not None and i >= max_batches:
+                    break
+                logits = model(inputs.to(temperature_parameter.device))
+                pre_temp_logits.append((logits * temperature_parameter).cpu())
+                all_targets.append(targets)
+        pre_temp_logits = torch.cat(pre_temp_logits)
+        all_targets = torch.cat(all_targets)
+
         # Optimizer
         optimizer = torch.optim.LBFGS(
             params=[temperature_parameter],
@@ -92,20 +109,12 @@ class TemperatureScaler(nn.Module):
         def closure() -> Tensor:
             optimizer.zero_grad()
 
-            # Get all batches from the validation data
-            all_logits = []
-            all_targets = []
-            for inputs, targets in dataloader:
-                logits = model(
-                    inputs.to(temperature_parameter.device)
-                )  # TODO: how should we pick the number of samples?
-                all_logits.append(logits)
-                all_targets.append(targets)
-            all_logits = torch.cat(all_logits).to(temperature_parameter.device)
-            all_targets = torch.cat(all_targets).to(temperature_parameter.device)
+            # Apply temperature scaling (only this operation needs gradient)
+            scaled_logits = pre_temp_logits.to(temperature_parameter.device) / temperature_parameter
+            targets_device = all_targets.to(temperature_parameter.device)
 
             # Compute the loss
-            loss = self.loss_fn(all_logits, all_targets)
+            loss = self.loss_fn(scaled_logits, targets_device)
 
             loss.backward()
             return loss
