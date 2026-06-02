@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 import math
 from typing import TYPE_CHECKING
 
@@ -48,19 +49,24 @@ class FactorizedCovariance(nn.Module):
 
         # Initialize factor parameters
         self.factor = nn.ParameterDict(
-            {
-                name: (
-                    torch.empty(
-                        *param.shape,
-                        self.rank,
-                        dtype=param.dtype,
-                        device=param.device,
+            OrderedDict(
+                [
+                    (
+                        name,
+                        (
+                            torch.empty(
+                                *param.shape,
+                                self.rank,
+                                dtype=param.dtype,
+                                device=param.device,
+                            )
+                            if param is not None
+                            else None
+                        ),
                     )
-                    if param is not None
-                    else None
-                )
-                for name, param in mean_parameters.items()
-            }
+                    for name, param in mean_parameters.items()
+                ]
+            )
         )
 
     def reset_parameters(
@@ -82,13 +88,40 @@ class FactorizedCovariance(nn.Module):
                 name: mean_parameter_scales for name in self.factor.keys()
             }
 
-        for name, param in self.factor.items():
-            if param is not None:
-                nn.init.normal_(
-                    param,
-                    mean=0,
-                    std=mean_parameter_scales[name] / math.sqrt(self.rank),
-                )
+        with torch.no_grad():  # Necessary for initializing the tensor.
+            # Initialize parameters to form an identity matrix when stacked row-wise
+            total_params = sum(
+                param.view(-1, self.rank).shape[0]
+                for param in self.factor.values()
+                if param is not None
+            )
+
+            # Create identity matrix
+            identity = torch.eye(min(total_params, self.rank))
+
+            # Distribute identity matrix across parameters
+            current_row = 0
+            for name, param in self.factor.items():
+                if param is not None:
+                    param_flat = param.view(-1, self.rank)
+                    num_rows = param_flat.shape[0]
+
+                    # Initialize with zeros
+                    param_flat.zero_()
+
+                    # Fill with identity values where possible
+                    end_row = min(current_row + num_rows, identity.shape[0])
+                    if current_row < identity.shape[0]:
+                        rows_to_fill = end_row - current_row
+                        cols_to_fill = min(identity.shape[1], param_flat.shape[1])
+                        param_flat[:rows_to_fill, :cols_to_fill] = identity[
+                            current_row:end_row, :cols_to_fill
+                        ]
+
+                    # Scale by mean parameter scale
+                    param_flat *= mean_parameter_scales[name]
+
+                    current_row += num_rows
 
     def factor_matmul(
         self,
@@ -131,7 +164,7 @@ class FactorizedCovariance(nn.Module):
         i = 0
         for name, param in self.factor.items():
             if param is not None:
-                result_dict[name] = split_result[i].reshape(
+                result_dict[name] = split_result[i].view(
                     *sample_shape, *param.shape[:-1]
                 )
                 i += 1
@@ -142,7 +175,7 @@ class FactorizedCovariance(nn.Module):
         """Stack parameters into a single tensor."""
         stacked_parameters = torch.vstack(
             [
-                factor_param.reshape(-1, self.rank)
+                factor_param.view(-1, self.rank)
                 for factor_param in self.factor.values()
                 if factor_param is not None
             ]

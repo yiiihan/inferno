@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from collections import OrderedDict
+from typing import TYPE_CHECKING, Iterator, Literal
 
 import torch
 from torch import nn
@@ -109,14 +110,19 @@ class _ConvNd(BNNMixin, nn.Module):
             if transposed
             else (out_channels, in_channels // groups, *kernel_size)
         )
-        mean_param_dict = {
-            **{"weight": torch.empty(weight_shape, **factory_kwargs)},
-            **(
-                {"bias": torch.empty(out_channels, **factory_kwargs)}
-                if bias
-                else {"bias": None}
-            ),
-        }
+        mean_param_dict = OrderedDict(
+            [
+                ("weight", torch.empty(weight_shape, **factory_kwargs)),
+                (
+                    "bias",
+                    (
+                        torch.empty(out_channels, **factory_kwargs)
+                        if bias
+                        else None
+                    ),
+                ),
+            ]
+        )
         if cov is None:
             self.params = nn.ParameterDict(mean_param_dict)
             self.params.cov = None
@@ -159,56 +165,98 @@ class _ConvNd(BNNMixin, nn.Module):
         if self.params.cov is not None:
             self.params.cov.reset_parameters(mean_parameter_scales)
 
-    def parameters_and_lrs(
+    def named_parameter_groups(
         self,
-        lr: float,
-        optimizer: Literal["SGD", "Adam"] = "SGD",
-    ) -> list[dict[str, Tensor | float]]:
+        optimizer: Literal["SGD", "Adam", "NGD"],
+        lr: float | None = None,
+        prefix: str = "",
+    ) -> Iterator[tuple[str, dict[str, Tensor | float]]]:
         fan_in, fan_out = nn.init._calculate_fan_in_and_fan_out(self.params.weight)
+        prefix = prefix + "." if prefix != "" else prefix
 
-        # Weights
-        mean_parameter_lr_scales = {}
-        mean_parameter_lr_scales["weight"] = self.parametrization.weight_lr_scale(
-            fan_in, fan_out, optimizer=optimizer, layer_type=self.layer_type
-        )
-        param_groups = [
-            {
-                "name": "params.weight",
+        if optimizer in ("SGD", "Adam"):
+            # Weights
+            mean_parameter_lr_scales = {}
+            mean_parameter_lr_scales["weight"] = self.parametrization.weight_lr_scale(
+                fan_in, fan_out, optimizer=optimizer, layer_type=self.layer_type
+            )
+            yield prefix + "params.weight", {
+                "param_names": [prefix + "params.weight"],
+                "module": prefix[:-1] if prefix.endswith(".") else prefix,
                 "params": [self.params.weight],
                 "lr": lr * mean_parameter_lr_scales["weight"],
             }
-        ]
 
-        # Bias
-        if self.params.bias is not None:
-            mean_parameter_lr_scales["bias"] = self.parametrization.bias_lr_scale(
-                fan_in, fan_out, optimizer=optimizer, layer_type=self.layer_type
-            )
-            param_groups += [
-                {
-                    "name": "params.bias",
+            # Bias
+            if self.params.bias is not None:
+                mean_parameter_lr_scales["bias"] = self.parametrization.bias_lr_scale(
+                    fan_in, fan_out, optimizer=optimizer, layer_type=self.layer_type
+                )
+                yield prefix + "params.bias", {
+                    "param_names": [prefix + "params.bias"],
+                    "module": prefix[:-1] if prefix.endswith(".") else prefix,
                     "params": [self.params.bias],
                     "lr": lr * mean_parameter_lr_scales["bias"],
                 }
-            ]
 
-        # Covariance
-        if self.params.cov is not None:
-            for name, param in self.params.cov.named_parameters():
-                lr_scaling = 1.0
-                if "weight" in name:
-                    lr_scaling = mean_parameter_lr_scales["weight"]
-                elif "bias" in name:
-                    lr_scaling = mean_parameter_lr_scales["bias"]
-                param_groups += [
-                    {
-                        "name": "params.cov." + name,
+            # Covariance
+            if self.params.cov is not None:
+                for name, param in self.params.cov.named_parameters():
+                    lr_scaling = 1.0
+                    if "weight" in name:
+                        lr_scaling = mean_parameter_lr_scales["weight"]
+                    elif "bias" in name:
+                        lr_scaling = mean_parameter_lr_scales["bias"]
+                    yield prefix + "params.cov." + name, {
+                        "param_names": [prefix + "params.cov." + name],
+                        "module": prefix[:-1] if prefix.endswith(".") else prefix,
                         "params": [param],
                         "lr": lr * lr_scaling * self.params.cov.lr_scaling[name],
                     }
-                ]
 
-        return param_groups
+        elif optimizer == "NGD":
+            # Mean parameters
+            mean_params = []
+            mean_param_names = []
+
+            mean_params.append(self.params.weight)
+            mean_param_names.append(prefix + "params.weight")
+
+            if self.params.bias is not None:
+                mean_params.append(self.params.bias)
+                mean_param_names.append(prefix + "params.bias")
+
+            mean_group = {
+                "param_names": mean_param_names,
+                "module": prefix[:-1] if prefix.endswith(".") else prefix,
+                "params": mean_params,
+            }
+
+            # Add covariance params reference for NGD preconditioning
+            if self.params.cov is not None:
+                mean_group["cov_params"] = list(self.params.cov.parameters())
+
+            yield prefix + "mean_params", mean_group
+
+            # Covariance parameters
+            if self.params.cov is not None:
+                cov_params = list(self.params.cov.parameters())
+                cov_param_names = [
+                    prefix + "params.cov." + name
+                    for name, _ in self.params.cov.named_parameters()
+                ]
+                yield prefix + "cov_params", {
+                    "param_names": cov_param_names,
+                    "module": prefix[:-1] if prefix.endswith(".") else prefix,
+                    "params": cov_params,
+                }
+
+    def parameters_and_lrs(
+        self,
+        lr: float,
+        optimizer: Literal["SGD", "Adam", "NGD"] = "SGD",
+    ) -> list[dict[str, Tensor | float]]:
+        return list(self.parameter_groups(optimizer=optimizer, lr=lr))
 
     def extra_repr(self):
         s = (

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING, Callable, Literal
+from typing import TYPE_CHECKING, Callable, Iterator, Literal
 
 import torch
 from torch import nn
@@ -43,11 +43,8 @@ class BNNMixin(abc.ABC):
                 layer.parametrization = self.parametrization
 
     def reset_parameters(self) -> None:
-        """Reset the parameters of the module and set the parametrization of all children
-        to the parametrization of the module.
-
-        This method should be implemented by subclasses to reset the parameters of the module.
-        """
+        """Reset the parameters of the module and its children (according to this module's parametrization)."""
+        # Check whether this module has any parameters itself (not just its children).
         if len(list(self.parameters(recurse=False))) > 0 or any(
             isinstance(child, (nn.ParameterDict, nn.ParameterList))
             for child in self.children()
@@ -69,45 +66,85 @@ class BNNMixin(abc.ABC):
                     child, parametrization=self.parametrization
                 )
 
-    def parameters_and_lrs(
+    def named_parameter_groups(
         self,
-        lr: float,
-        optimizer: Literal["SGD", "Adam"],
-    ) -> list[dict[str, Tensor | float]]:
-        """Get the parameters of the module and their learning rates for the chosen optimizer
-        and the parametrization of the module.
+        optimizer: Literal["SGD", "Adam", "NGD"],
+        lr: float | None = None,
+        prefix: str = "",
+    ) -> Iterator[tuple[str, dict[str, Tensor | float]]]:
+        """Return the parameters of a module sorted into named groups.
 
-        :param lr: The global learning rate.
-        :param optimizer: The optimizer being used.
+        :param optimizer: The optimizer for which to return parameter groups.
+        :param lr: The global learning rate. Needs to be specified for SGD and Adam.
+        :param prefix: Prefix to add to the names of the parameter groups.
         """
+        prefix = prefix + "." if prefix != "" else prefix
+
         # Check whether this module has any parameters itself (not just its children).
         if len(list(self.parameters(recurse=False))) > 0 or any(
             isinstance(child, (nn.ParameterDict, nn.ParameterList))
             for child in self.children()
         ):
             raise NotImplementedError(
-                f"BNNMixin modules with parameters assigned to them must override 'parameters_and_lrs()' "
-                "to define which learning rate scaling should be used according to the parametrization."
+                f"BNNMixin modules with parameters assigned to them must override 'named_parameter_groups()' "
+                "to define how parameters should be grouped for optimization and which learning rate scaling "
+                "should be used according to the parametrization."
             )
 
-        param_groups = []
+        # Cycle through all children of the module and get their parameter groups.
+        for name, child in self.named_children():
 
-        # Cycle through all children of the module and get their parameters and learning rates
-        for child in self.children():
-
-            # For layers with leaf parameters, return them with adjusted learning rate based on
-            # the parametrization.
             if isinstance(child, BNNMixin):
-                param_groups += child.parameters_and_lrs(lr=lr, optimizer=optimizer)
-            else:
-                param_groups += parameters_and_lrs_of_torch_module(
-                    child,
-                    lr=lr,
-                    parametrization=self.parametrization,
+                # Recurse all the way to leaf modules.
+                yield from child.named_parameter_groups(
+                    prefix=prefix + name,
                     optimizer=optimizer,
+                    lr=lr,
+                )
+            else:
+                # For torch leaf modules, return parameter groups.
+                yield from named_parameter_groups_of_torch_module(
+                    child,
+                    optimizer=optimizer,
+                    lr=lr,
+                    # For nn.Modules we need the parametrization to set learning rates.
+                    parametrization=self.parametrization,
+                    prefix=prefix + name,
                 )
 
-        return param_groups
+    def parameter_groups(
+        self,
+        optimizer: Literal["SGD", "Adam", "NGD"],
+        lr: float | None = None,
+        prefix: str = "",
+    ) -> Iterator[dict[str, Tensor | float]]:
+        """Return the parameters of a module sorted into groups.
+
+        :param optimizer: The optimizer for which to return parameter groups.
+        :param lr: The global learning rate. Needs to be specified for SGD and Adam.
+        :param prefix: Prefix to add to the names of the parameter groups.
+        """
+        for _, param_group in self.named_parameter_groups(
+            optimizer=optimizer,
+            lr=lr,
+            prefix=prefix,
+        ):
+            yield param_group
+
+    def parameters_and_lrs(
+        self,
+        lr: float,
+        optimizer: Literal["SGD", "Adam", "NGD"] = "SGD",
+        prefix: str = "",
+    ) -> list[dict[str, Tensor | float]]:
+        """Get the parameters of the module and their learning rates for the chosen optimizer
+        and the parametrization of the module.
+
+        :param lr: The global learning rate.
+        :param optimizer: The optimizer being used.
+        :param prefix: Prefix to add to the names of the parameter groups in the returned list.
+        """
+        return list(self.parameter_groups(prefix=prefix, optimizer=optimizer, lr=lr))
 
     def forward(
         self,
@@ -174,12 +211,110 @@ def reset_parameters_of_torch_module(
             reset_parameters_of_torch_module(child, parametrization=parametrization)
 
 
+def named_parameter_groups_of_torch_module(
+    module: nn.Module,
+    optimizer: Literal["SGD", "Adam", "NGD"],
+    parametrization: Parametrization,
+    lr: float | None = None,
+    prefix: str = "",
+) -> Iterator[tuple[str, dict[str, Tensor | float]]]:
+    """Return the parameters of a torch module sorted into named groups.
+
+    :param module: The torch.nn.Module to get the parameters and learning rates of.
+    :param optimizer: The optimizer being used.
+    :param parametrization: The parametrization to use.
+    :param lr: The global learning rate.
+    :param prefix: Prefix to add to the names of the parameter groups.
+    """
+
+    prefix = prefix + "." if prefix != "" else prefix
+
+    # Direct parameters
+    direct_parameters = {
+        name: param for name, param in module.named_parameters(recurse=False)
+    }
+    if len(direct_parameters) > 0:
+        if optimizer in ["SGD", "Adam"]:
+            # Each group is a single parameter (with its own learning rate scaling).
+            if isinstance(
+                module,
+                (
+                    nn.LayerNorm,
+                    nn.GroupNorm,
+                    nn.BatchNorm1d,
+                    nn.BatchNorm2d,
+                    nn.BatchNorm3d,
+                ),
+            ):
+                fan_out = module.weight.shape.numel()
+                yield prefix + "weight", {
+                    "param_names": [prefix + "weight"],
+                    "module": prefix[:-1] if prefix.endswith(".") else prefix,
+                    "params": [module.weight],
+                    "lr": lr
+                    * parametrization.weight_lr_scale(
+                        fan_in=1.0,
+                        fan_out=fan_out,
+                        optimizer=optimizer,
+                        layer_type="input",
+                    ),
+                }
+
+                if "bias" in direct_parameters and module.bias is not None:
+                    yield prefix + "bias", {
+                        "param_names": [prefix + "bias"],
+                        "module": prefix[:-1] if prefix.endswith(".") else prefix,
+                        "params": [module.bias],
+                        "lr": lr
+                        * parametrization.bias_lr_scale(
+                            fan_in=1.0,
+                            fan_out=fan_out,
+                            optimizer=optimizer,
+                            layer_type="input",
+                        ),
+                    }
+            else:
+                raise NotImplementedError(
+                    f"Cannot set learning rates of module: {module.__class__.__name__} "
+                    f"according to the {parametrization.__class__.__name__} parametrization. "
+                    "Consider writing a custom BNNMixin module."
+                )
+        elif optimizer == "NGD":
+            yield prefix + "params", {
+                "param_names": [prefix + name for name in direct_parameters.keys()],
+                "module": prefix[:-1] if prefix.endswith(".") else prefix,
+                "params": list(direct_parameters.values()),
+            }
+        else:
+            raise ValueError(
+                f"Unknown optimizer '{optimizer}'. Cannot group parameters accordingly."
+            )
+
+    # Cycle through all children of the module and get their parameter groups.
+    for name, child in module.named_children():
+        if isinstance(child, BNNMixin):
+            yield from child.named_parameter_groups(
+                optimizer=optimizer,
+                lr=lr,
+                prefix=prefix + name,
+            )
+        else:
+            yield from named_parameter_groups_of_torch_module(
+                child,
+                optimizer=optimizer,
+                parametrization=parametrization,
+                lr=lr,
+                prefix=prefix + name,
+            )
+
+
+# Backward-compatible alias
 def parameters_and_lrs_of_torch_module(
     module: nn.Module,
     /,
     lr: float,
     parametrization: Parametrization,
-    optimizer: Literal["SGD", "Adam"],
+    optimizer: Literal["SGD", "Adam", "NGD"] = "SGD",
 ) -> list[dict[str, Tensor | float]]:
     """Get the parameters and their learning rates of module and its children for the chosen parametrization and optimizer.
 
@@ -188,68 +323,15 @@ def parameters_and_lrs_of_torch_module(
     :param parametrization: The parametrization to use.
     :param optimizer: The optimizer being used.
     """
-    param_groups = []
-    module_parameter_names = [
-        param_name for param_name, _ in module.named_parameters(recurse=False)
-    ]
-    if len(module_parameter_names) == 0:
-        pass
-    elif isinstance(
-        module,
-        (
-            nn.LayerNorm,
-            nn.GroupNorm,
-            nn.BatchNorm1d,
-            nn.BatchNorm2d,
-            nn.BatchNorm3d,
-        ),
-    ):
-        fan_out = module.weight.shape.numel()
-        param_groups += [
-            {
-                "params": [module.weight],
-                "lr": lr
-                * parametrization.weight_lr_scale(
-                    fan_in=1.0,
-                    fan_out=fan_out,
-                    optimizer=optimizer,
-                    layer_type="input",
-                ),
-            }
-        ]
-
-        if module.bias is not None:
-            param_groups += [
-                {
-                    "params": [module.bias],
-                    "lr": lr
-                    * parametrization.bias_lr_scale(
-                        fan_in=1.0,
-                        fan_out=fan_out,
-                        optimizer=optimizer,
-                        layer_type="input",
-                    ),
-                }
-            ]
-    else:
-        raise NotImplementedError(
-            f"Cannot set learning rates of module: {module.__class__.__name__} "
-            f"according to the {parametrization.__class__.__name__} parametrization."
+    return [
+        param_group
+        for _, param_group in named_parameter_groups_of_torch_module(
+            module,
+            optimizer=optimizer,
+            parametrization=parametrization,
+            lr=lr,
         )
-
-    # Cycle through all children of the module and get their parameters and learning rates
-    for child in module.children():
-        if isinstance(child, BNNMixin):
-            param_groups += child.parameters_and_lrs(lr=lr, optimizer=optimizer)
-        else:
-            param_groups += parameters_and_lrs_of_torch_module(
-                child,
-                lr=lr,
-                parametrization=parametrization,
-                optimizer=optimizer,
-            )
-
-    return param_groups
+    ]
 
 
 def batched_forward(obj: nn.Module, num_batch_dims: int) -> Callable[
@@ -276,12 +358,9 @@ def batched_forward(obj: nn.Module, num_batch_dims: int) -> Callable[
         input: Float[Tensor, "*sample *batch *in_feature"],
     ) -> Float[Tensor, "*sample *batch *out_feature"]:
         flattened_input = input.flatten(start_dim=0, end_dim=num_batch_dims - 2)
-        flattened_output = torch.vmap(
-            obj.__call__,
-            in_dims=0,
-            out_dims=0,
-            # randomness="same",  # TODO: should the randomness across samples be the same or not (e.g. for dropout)?
-        )(flattened_input)
+        flattened_output = torch.vmap(obj.__call__, in_dims=0, out_dims=0)(
+            flattened_input
+        )
         return flattened_output.unflatten(0, input.shape[: num_batch_dims - 1])
 
     return batched_forward_helper

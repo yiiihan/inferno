@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from collections import OrderedDict
 from typing import Callable
 
 from torch import nn
@@ -91,3 +92,13 @@ class LeNet5(bnn.Sequential):
         ]
 
         super().__init__(*layers, parametrization=parametrization)
+
+    def __getitem__(self, idx):
+        """Support slicing to get sub-sequences of layers."""
+        if isinstance(idx, slice):
+            return bnn.Sequential(
+                OrderedDict(list(self._modules.items())[idx]),
+                parametrization=self.parametrization,
+            )
+        else:
+            return self._get_item_by_idx(self._modules.values(), idx)

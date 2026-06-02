@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import abc
+from collections import OrderedDict
 from typing import TYPE_CHECKING
 
 import torch
@@ -16,7 +17,7 @@ class BNNParameter(nn.ParameterDict, abc.ABC):
     def __init__(
         self, hyperparameters: dict[str, Float[Tensor, "*hyperparameter"]] | None = None
     ):
-        super().__init__(hyperparameters)
+        super().__init__(OrderedDict(hyperparameters))
 
     def sample(
         self,

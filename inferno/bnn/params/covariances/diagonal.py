@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import math
+from collections import OrderedDict
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -32,18 +32,21 @@ class DiagonalCovariance(FactorizedCovariance):
 
         # Initialize scale parameters
         self.scale = nn.ParameterDict(
-            {
-                name: (
-                    torch.empty(
-                        *param.shape,
-                        dtype=param.dtype,
-                        device=param.device,
+            OrderedDict(
+                [
+                    (
+                        name,
+                        (
+                            torch.empty(
+                                *param.shape, dtype=param.dtype, device=param.device
+                            )
+                            if param is not None
+                            else None
+                        ),
                     )
-                    if param is not None
-                    else None
-                )
-                for name, param in mean_parameters.items()
-            }
+                    for name, param in mean_parameters.items()
+                ]
+            )
         )
 
     def reset_parameters(

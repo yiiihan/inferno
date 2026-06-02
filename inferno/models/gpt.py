@@ -702,6 +702,28 @@ class GPT(bnn.BNNMixin, nn.Module):
 # ---------------------------------------------------------------------------
 
 
+class GPT2_Nano(GPT):
+    """GPT-2 Nano (~10M transformer body): 6 layers, 6 heads, hidden_dim=384.
+
+    Designed for small datasets like TinyStories where GPT-2 Small is
+    over-parameterised. The transformer body is ~10M parameters; the
+    embedding / LM-head add ~19M each for the GPT-2 vocab (50257 tokens).
+
+    :param **kwargs: Passed to :class:`GPT`. Must include ``vocab_size`` and
+        ``context_length``.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(
+            *args,
+            num_layers=6,
+            num_heads=6,
+            hidden_dim=384,
+            mlp_dim=1536,
+            **kwargs,
+        )
+
+
 class GPT2_Small(GPT):
     """GPT-2 Small (~117M parameters): 12 layers, 12 heads, hidden_dim=768.
 

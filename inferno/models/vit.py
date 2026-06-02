@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from functools import partial
-from typing import TYPE_CHECKING, Callable, Literal, NamedTuple
+from typing import TYPE_CHECKING, Callable, Iterator, Literal, NamedTuple
 
 import torch
 import torch.nn as nn
@@ -19,6 +19,7 @@ from . import MLP
 from .. import bnn
 from ..bnn import params
 from ..bnn.modules.bnn_mixin import (
+    named_parameter_groups_of_torch_module,
     parameters_and_lrs_of_torch_module,
     reset_parameters_of_torch_module,
 )
@@ -230,49 +231,64 @@ class Encoder(bnn.BNNMixin, nn.Module):
         if self.pre_ln is not None:
             reset_parameters_of_torch_module(self.pre_ln, parametrization=self.parametrization)
 
-    def parameters_and_lrs(
+    def named_parameter_groups(
         self,
-        lr: float,
-        optimizer: Literal["SGD", "Adam"],
-    ) -> list[dict[str, Tensor | float]]:
-        """Get the parameters of the module and their learning rates for the chosen optimizer
-        and the parametrization of the module.
+        optimizer: Literal["SGD", "Adam", "NGD"],
+        lr: float | None = None,
+        prefix: str = "",
+    ) -> Iterator[tuple[str, dict[str, Tensor | float]]]:
+        """Return the parameters of a module sorted into named groups.
 
         Needs to be implemented because Encoder has direct parameters.
 
+        :param optimizer: The optimizer for which to return parameter groups.
         :param lr: The global learning rate.
-        :param optimizer: The optimizer being used.
+        :param prefix: Prefix to add to the names of the parameter groups.
         """
-
-        param_groups = []
+        prefix = prefix + "." if prefix != "" else prefix
 
         # direct parameters
-        param_groups += [
-            {
-                "name": "pos_embedding",
+        if optimizer in ("SGD", "Adam"):
+            yield prefix + "pos_embedding", {
+                "param_names": [prefix + "pos_embedding"],
+                "module": prefix[:-1] if prefix.endswith(".") else prefix,
                 "params": [self.pos_embedding],
                 "lr": lr,
             }
-        ]
+        elif optimizer == "NGD":
+            yield prefix + "pos_embedding", {
+                "param_names": [prefix + "pos_embedding"],
+                "module": prefix[:-1] if prefix.endswith(".") else prefix,
+                "params": [self.pos_embedding],
+            }
 
         # child modules
-        param_groups += self.layers.parameters_and_lrs(lr=lr, optimizer=optimizer)
-        param_groups += parameters_and_lrs_of_torch_module(
+        yield from self.layers.named_parameter_groups(
+            optimizer=optimizer, lr=lr, prefix=prefix + "layers"
+        )
+        yield from named_parameter_groups_of_torch_module(
             self.ln,
+            optimizer=optimizer,
             lr=lr,
             parametrization=self.parametrization,
-            optimizer=optimizer,
+            prefix=prefix + "ln",
         )
 
         if self.pre_ln is not None:
-            param_groups += parameters_and_lrs_of_torch_module(
+            yield from named_parameter_groups_of_torch_module(
                 self.pre_ln,
+                optimizer=optimizer,
                 lr=lr,
                 parametrization=self.parametrization,
-                optimizer=optimizer,
+                prefix=prefix + "pre_ln",
             )
 
-        return param_groups
+    def parameters_and_lrs(
+        self,
+        lr: float,
+        optimizer: Literal["SGD", "Adam", "NGD"] = "SGD",
+    ) -> list[dict[str, Tensor | float]]:
+        return list(self.parameter_groups(optimizer=optimizer, lr=lr))
 
     def forward(
         self,
@@ -683,39 +699,58 @@ class VisionTransformer(bnn.BNNMixin, nn.Module):
             self.pre_head.reset_parameters()
         self.fc.reset_parameters()
 
-    def parameters_and_lrs(
+    def named_parameter_groups(
         self,
-        lr: float,
-        optimizer: Literal["SGD", "Adam"],
-    ) -> list[dict[str, Tensor | float]]:
-        """Get the parameters of the module and their learning rates for the chosen optimizer
-        and the parametrization of the module.
+        optimizer: Literal["SGD", "Adam", "NGD"],
+        lr: float | None = None,
+        prefix: str = "",
+    ) -> Iterator[tuple[str, dict[str, Tensor | float]]]:
+        """Return the parameters of a module sorted into named groups.
 
         Needs to be implemented because VisionTransformer has direct parameters.
 
+        :param optimizer: The optimizer for which to return parameter groups.
         :param lr: The global learning rate.
-        :param optimizer: The optimizer being used.
+        :param prefix: Prefix to add to the names of the parameter groups.
         """
-
-        param_groups = []
+        prefix = prefix + "." if prefix != "" else prefix
 
         # Direct parameters
-        param_groups += [
-            {
-                "name": "class_token",
+        if optimizer in ("SGD", "Adam"):
+            yield prefix + "class_token", {
+                "param_names": [prefix + "class_token"],
+                "module": prefix[:-1] if prefix.endswith(".") else prefix,
                 "params": [self.class_token],
                 "lr": lr,
             }
-        ]
+        elif optimizer == "NGD":
+            yield prefix + "class_token", {
+                "param_names": [prefix + "class_token"],
+                "module": prefix[:-1] if prefix.endswith(".") else prefix,
+                "params": [self.class_token],
+            }
 
         # Child modules
-        param_groups += self.conv_proj.parameters_and_lrs(lr=lr, optimizer=optimizer)
-        param_groups += self.encoder.parameters_and_lrs(lr=lr, optimizer=optimizer)
+        yield from self.conv_proj.named_parameter_groups(
+            optimizer=optimizer, lr=lr, prefix=prefix + "conv_proj"
+        )
+        yield from self.encoder.named_parameter_groups(
+            optimizer=optimizer, lr=lr, prefix=prefix + "encoder"
+        )
         if self.pre_head is not None:
-            param_groups += self.pre_head.parameters_and_lrs(lr=lr, optimizer=optimizer)
-        param_groups += self.fc.parameters_and_lrs(lr=lr, optimizer=optimizer)
+            yield from self.pre_head.named_parameter_groups(
+                optimizer=optimizer, lr=lr, prefix=prefix + "pre_head"
+            )
+        yield from self.fc.named_parameter_groups(
+            optimizer=optimizer, lr=lr, prefix=prefix + "fc"
+        )
 
-        return param_groups
+    def parameters_and_lrs(
+        self,
+        lr: float,
+        optimizer: Literal["SGD", "Adam", "NGD"] = "SGD",
+    ) -> list[dict[str, Tensor | float]]:
+        return list(self.parameter_groups(optimizer=optimizer, lr=lr))
 
     def _process_input(
         self,

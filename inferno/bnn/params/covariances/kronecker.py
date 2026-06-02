@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 import math
 from typing import TYPE_CHECKING
 
@@ -32,7 +33,7 @@ class KroneckerCovariance(FactorizedCovariance):
     $$
 
     where $\mathbf{S}_{\text{in}}$ and $\mathbf{S}_{\text{out}}$ are the
-    low-rank factors of the Kronecker factors $\mathbf{C}_{\text{in}}$ and 
+    low-rank factors of the Kronecker factors $\mathbf{C}_{\text{in}}$ and
     $\mathbf{C}_{\text{out}}$.
 
     :param input_rank: Rank of the input Kronecker factor. If None, assumes full rank.
@@ -91,16 +92,9 @@ class KroneckerCovariance(FactorizedCovariance):
         self.rank = self.input_rank * self.output_rank
 
         # Initialize factor parameters
-        input_factor_dict = {}
+        input_factor_dict = OrderedDict()
         for name, param in mean_parameters.items():
-            if name == "bias":
-                if mean_parameters["bias"] is not None:
-                    input_factor_dict[name] = torch.empty(
-                        1, self.input_rank, dtype=param.dtype, device=param.device
-                    )
-                else:
-                    input_factor_dict[name] = None
-            elif name == "weight":
+            if name == "weight":
                 # Shapes (especially for convolutions) are inspired by K-FAC
                 # See https://fdangel.com/posts/kfac_explained.html
                 input_factor_dict[name] = torch.empty(
@@ -117,6 +111,13 @@ class KroneckerCovariance(FactorizedCovariance):
                         device=param.device,
                     )
                 )
+            elif name == "bias":
+                if mean_parameters["bias"] is not None:
+                    input_factor_dict[name] = torch.empty(
+                        1, self.input_rank, dtype=param.dtype, device=param.device
+                    )
+                else:
+                    input_factor_dict[name] = None
             else:
                 raise NotImplementedError(
                     "Kronecker covariance currently only supports bias and weight parameters."
@@ -176,16 +177,31 @@ class KroneckerCovariance(FactorizedCovariance):
 
         # Split result into parameter shapes
         result_dict = {}
-        starting_idx_weight_result = 0
-        if "bias" in self.input_factor.keys() and self.input_factor["bias"] is not None:
-            result_dict["bias"] = result[..., : self.output_factor.shape[0]]
-            starting_idx_weight_result = self.output_factor.shape[0]
-        if "weight" in self.input_factor.keys():
-            result_dict["weight"] = result[..., starting_idx_weight_result:].view(
-                *sample_shape,
-                self.output_factor.shape[0],
-                *self.input_factor["weight"].shape[:-1],
-            )
+        start_idx_param_result = 0
+        for name in self.input_factor.keys():
+            if name == "weight":
+                end_idx_param_result = (
+                    start_idx_param_result
+                    + self.output_factor.shape[0]
+                    * math.prod(self.input_factor[name].shape[:-1])
+                )
+                result_dict[name] = result[
+                    ..., start_idx_param_result:end_idx_param_result
+                ].view(
+                    *sample_shape,
+                    self.output_factor.shape[0],
+                    *self.input_factor[name].shape[:-1],
+                )
+            elif name == "bias" and self.input_factor["bias"] is not None:
+                end_idx_param_result = (
+                    start_idx_param_result + self.output_factor.shape[0]
+                )
+                result_dict[name] = result[
+                    ..., start_idx_param_result:end_idx_param_result
+                ]
+
+            start_idx_param_result = end_idx_param_result
+
         return result_dict
 
     @property
